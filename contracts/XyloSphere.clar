@@ -11,6 +11,8 @@
 (define-constant err-invalid-timelock (err u106))
 (define-constant err-asset-locked (err u107))
 (define-constant err-invalid-signature (err u108))
+(define-constant err-invalid-vault-id (err u109))
+(define-constant err-invalid-address (err u110))
 
 ;; Data Variables
 (define-data-var contract-active bool true)
@@ -46,6 +48,24 @@
   { recovery-address: principal, recovery-timelock: uint }
 )
 
+;; Input Validation Functions
+(define-private (is-valid-vault-id (vault-id uint))
+  (and (> vault-id u0) (<= vault-id (var-get total-vaults)))
+)
+
+(define-private (is-valid-principal (addr principal))
+  (not (is-eq addr 'SP000000000000000000002Q6VF78))
+)
+
+(define-private (is-valid-timelock (timelock uint))
+  (and (> timelock stacks-block-height) (< timelock (+ stacks-block-height u1000000)))
+)
+
+(define-private (sanitize-conditions (conditions (string-ascii 256)))
+  ;; Basic validation - ensure conditions string is not empty and has reasonable length
+  (and (> (len conditions) u0) (<= (len conditions) u256))
+)
+
 ;; Public Functions
 
 (define-public (create-vault (asset-amount uint) (timelock uint) (conditions (string-ascii 256)) (authorized-withdrawers (list 5 principal)))
@@ -55,10 +75,15 @@
       (current-height stacks-block-height)
       (user-count (default-to u0 (get count (map-get? user-vault-count { user: tx-sender }))))
     )
+    ;; Input validation
     (asserts! (var-get contract-active) err-unauthorized)
     (asserts! (> asset-amount u0) err-invalid-amount)
-    (asserts! (> timelock current-height) err-invalid-timelock)
+    (asserts! (is-valid-timelock timelock) err-invalid-timelock)
+    (asserts! (sanitize-conditions conditions) err-invalid-signature)
     (asserts! (<= (len authorized-withdrawers) u5) err-unauthorized)
+    
+    ;; Validate all authorized withdrawers
+    (asserts! (fold validate-withdrawer-fold authorized-withdrawers true) err-invalid-address)
 
     (map-set vaults
       { vault-id: vault-id }
@@ -93,6 +118,8 @@
       (user-permission (map-get? vault-permissions { vault-id: vault-id, user: tx-sender }))
     )
     (begin
+      ;; Input validation
+      (asserts! (is-valid-vault-id vault-id) err-invalid-vault-id)
       (asserts! (var-get contract-active) err-unauthorized)
       (asserts! (get is-active vault) err-asset-locked)
       (asserts! (>= current-height (get timelock vault)) err-condition-not-met)
@@ -116,8 +143,11 @@
       (current-height stacks-block-height)
     )
     (begin
+      ;; Input validation
+      (asserts! (is-valid-vault-id vault-id) err-invalid-vault-id)
+      (asserts! (is-valid-principal recovery-address) err-invalid-address)
+      (asserts! (is-valid-timelock recovery-timelock) err-invalid-timelock)
       (asserts! (is-eq tx-sender (get owner vault)) err-unauthorized)
-      (asserts! (> recovery-timelock current-height) err-invalid-timelock)
 
       (map-set emergency-recovery
         { vault-id: vault-id }
@@ -136,6 +166,8 @@
       (current-height stacks-block-height)
     )
     (begin
+      ;; Input validation
+      (asserts! (is-valid-vault-id vault-id) err-invalid-vault-id)
       (asserts! (is-eq tx-sender (get recovery-address recovery-info)) err-unauthorized)
       (asserts! (>= current-height (get recovery-timelock recovery-info)) err-condition-not-met)
 
@@ -154,6 +186,9 @@
       (vault (unwrap! (map-get? vaults { vault-id: vault-id }) err-not-found))
     )
     (begin
+      ;; Input validation
+      (asserts! (is-valid-vault-id vault-id) err-invalid-vault-id)
+      (asserts! (sanitize-conditions new-conditions) err-invalid-signature)
       (asserts! (is-eq tx-sender (get owner vault)) err-unauthorized)
       (asserts! (get is-active vault) err-asset-locked)
 
@@ -172,6 +207,8 @@
       (vault (unwrap! (map-get? vaults { vault-id: vault-id }) err-not-found))
     )
     (begin
+      ;; Input validation
+      (asserts! (is-valid-vault-id vault-id) err-invalid-vault-id)
       (asserts! (is-eq tx-sender (get owner vault)) err-unauthorized)
 
       (map-set vaults
@@ -192,6 +229,10 @@
 )
 
 ;; Private Functions
+
+(define-private (validate-withdrawer-fold (withdrawer principal) (is-valid bool))
+  (and is-valid (is-valid-principal withdrawer))
+)
 
 (define-private (set-single-permission-fold (withdrawer principal) (vault-id uint))
   (begin
@@ -216,19 +257,31 @@
 ;; Read-only Functions
 
 (define-read-only (get-vault-info (vault-id uint))
-  (map-get? vaults { vault-id: vault-id })
+  (if (is-valid-vault-id vault-id)
+    (map-get? vaults { vault-id: vault-id })
+    none
+  )
 )
 
 (define-read-only (get-user-vault-count (user principal))
-  (default-to u0 (get count (map-get? user-vault-count { user: user })))
+  (if (is-valid-principal user)
+    (default-to u0 (get count (map-get? user-vault-count { user: user })))
+    u0
+  )
 )
 
 (define-read-only (get-vault-permissions (vault-id uint) (user principal))
-  (map-get? vault-permissions { vault-id: vault-id, user: user })
+  (if (and (is-valid-vault-id vault-id) (is-valid-principal user))
+    (map-get? vault-permissions { vault-id: vault-id, user: user })
+    none
+  )
 )
 
 (define-read-only (get-emergency-recovery (vault-id uint))
-  (map-get? emergency-recovery { vault-id: vault-id })
+  (if (is-valid-vault-id vault-id)
+    (map-get? emergency-recovery { vault-id: vault-id })
+    none
+  )
 )
 
 (define-read-only (get-contract-status)
@@ -250,15 +303,18 @@
       (user-permission (map-get? vault-permissions { vault-id: vault-id, user: user }))
       (current-height stacks-block-height)
     )
-    (match vault
-      vault-data
-      (and
-        (get is-active vault-data)
-        (>= current-height (get timelock vault-data))
-        (or
-          (is-eq user (get owner vault-data))
-          (is-some user-permission)
+    (if (and (is-valid-vault-id vault-id) (is-valid-principal user))
+      (match vault
+        vault-data
+        (and
+          (get is-active vault-data)
+          (>= current-height (get timelock vault-data))
+          (or
+            (is-eq user (get owner vault-data))
+            (is-some user-permission)
+          )
         )
+        false
       )
       false
     )
